@@ -1,0 +1,14 @@
+service vendor.qti.vibrator /system/bin/vendor.qti.hardware.vibrator.service
+    class hal
+    interface aidl android.hardware.vibrator.IVibrator/default
+    user root
+    group root input
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64:/sbin
+    disabled
+    seclabel u:r:recovery:s0
+
+on late-init
+    write /sys/class/leds/vibrator/trigger "transient"
+
+on property:twrp.modules.loaded=true
+    write /sys/class/leds/vibrator/trigger "transient"

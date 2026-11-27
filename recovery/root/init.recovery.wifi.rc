@@ -1,0 +1,45 @@
+# OrangeFox on-demand WLAN bring-up for Redmi Note 12 Turbo (marble / QCA6490).
+#
+# Drivers (cnss2 / qca_cld3_qca6490) are loaded by OrangeFox's module loader
+# from the installed 5.10 or 6.6 ROM and stay idle until the user taps
+# "Start WLAN", which sets sys.fox.wlan.up=1. Keeping WLAN initialization off
+# the boot-critical path prevents stalls or panics during early recovery boot.
+
+on property:sys.fox.wlan.up=1
+    mkdir /tmp/recovery 0777
+    mkdir /tmp/recovery/sockets 0777
+
+    # Ensure modem firmware partition is mounted for QCA6490 WLAN firmware images
+    mkdir /firmware 0755
+    mount vfat /dev/block/bootdevice/by-name/modem${ro.boot.slot_suffix} /firmware ro
+
+    # Point firmware loader at /etc/firmware where WCNSS_qcom_cfg.ini resides
+    write /sys/module/firmware_class/parameters/path /etc/firmware
+
+    # Expose modem firmware under /vendor/firmware_mnt and /etc/firmware/qca6490
+    # so GKI 6.6 cnss2 qca6490/{amss.bin,m3.bin,bdwlan*} lookups resolve cleanly
+    symlink /firmware /vendor/firmware_mnt
+    symlink /firmware/image /etc/firmware/qca6490
+
+    # Stage per-device WLAN MAC from persist partition
+    mkdir /etc/firmware/wlan 0755
+    mkdir /etc/firmware/wlan/qca_cld 0755
+    mkdir /etc/firmware/wlan/qca_cld/qca6490 0755
+    mkdir /mnt/wlan_persist 0755
+    mount ext4 /dev/block/bootdevice/by-name/persist /mnt/wlan_persist ro
+    copy /mnt/wlan_persist/qca6490/wlan_mac.bin /etc/firmware/wlan/qca_cld/qca6490/wlan_mac.bin
+    umount /mnt/wlan_persist
+
+    # Trigger cnss2 cold-boot and qcacld-3.0 HDD bring-up (supports 5.10 & 6.6)
+    write /sys/kernel/cnss/fs_ready 1
+    write /dev/wlan ON
+    wait /sys/class/net/wlan0 15
+
+    start wpa_supplicant
+
+    # Reset trigger so subsequent WLAN toggles re-fire this block
+    setprop sys.fox.wlan.up 0
+
+service wpa_supplicant /system/bin/wpa_supplicant -Dnl80211 -iwlan0 -dd -O/tmp/recovery/sockets -c/vendor/etc/wifi/wpa_supplicant.conf
+    disabled
+    seclabel u:r:recovery:s0

@@ -1,0 +1,623 @@
+name: Build OrangeFox Recovery (marble)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_branch:
+        description: "OrangeFox Manifest branch (https://gitlab.com/OrangeFox/Manifest)"
+        type: string
+        required: true
+        default: "fox_16.0"
+      build_type:
+        description: "OrangeFox build type (FOX_BUILD_TYPE)"
+        type: choice
+        required: true
+        default: "Unofficial"
+        options:
+          - "Unofficial"
+          - "Alpha"
+          - "Beta"
+          - "Stable"
+      variant:
+        description: "Build variant tag (FOX_VARIANT)"
+        type: string
+        required: false
+        default: "A16-5.10-6.6"
+      patch_version:
+        description: "Optional integer FOX_MAINTAINER_PATCH_VERSION (leave empty for default)"
+        type: string
+        required: false
+        default: ""
+      enable_wlan:
+        description: "Set OF_ENABLE_WLAN=1 / OF_WLAN_AP=1 (auto-activates when manifest includes WLAN sources)"
+        type: boolean
+        required: false
+        default: true
+      create_release:
+        description: "Publish build artifacts to a GitHub Release"
+        type: boolean
+        required: false
+        default: true
+      send_to_telegram:
+        description: "Send build output and status to Telegram bot chat"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: orangefox-marble-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build OrangeFox fox_16.0 for marble
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    outputs:
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      commit_title: ${{ steps.meta.outputs.commit_title }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+      ofox_version: ${{ steps.meta.outputs.ofox_version }}
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+      zip_name: ${{ steps.package.outputs.zip_name }}
+      img_name: ${{ steps.package.outputs.img_name }}
+
+    steps:
+      - name: Maximize free disk space and select workspace
+        id: workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop systemd-oomd 2>/dev/null || true
+          echo "=== Disk usage before cleanup ==="
+          df -h
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/* \
+            /usr/local/lib/node_modules \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/local/google-cloud-sdk \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /opt/az \
+            /usr/share/az_* \
+            /opt/microsoft \
+            /var/lib/docker \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/graalvm || true
+          sudo apt-get clean || true
+
+          # Pick the mount point with the most free space (/mnt vs /)
+          MNT_AVAIL=$(df -BG --output=avail /mnt 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)
+          ROOT_AVAIL=$(df -BG --output=avail / 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)
+          if [ "${MNT_AVAIL:-0}" -ge "${ROOT_AVAIL:-0}" ]; then
+            BUILD_BASE="/mnt/orangefox"
+            SWAP_DIR="/"
+            SWAP_AVAIL="${ROOT_AVAIL:-0}"
+          else
+            BUILD_BASE="${HOME}/orangefox"
+            SWAP_DIR="/mnt"
+            SWAP_AVAIL="${MNT_AVAIL:-0}"
+          fi
+
+          sudo mkdir -p "${BUILD_BASE}" "${BUILD_BASE}/tmp"
+          sudo chown -R "$(id -u):$(id -g)" "${BUILD_BASE}"
+
+          # Place 16 GiB swapfile (+2 GiB built-in = 18 GiB swap) on secondary mount
+          # when >=28 GiB free (keeping >=12 GiB free on /) to protect out/ headroom.
+          if [ "${SWAP_AVAIL}" -ge 28 ]; then
+            SWAP_FILE="${SWAP_DIR%/}/orangefox.swapfile"
+          else
+            SWAP_FILE="${BUILD_BASE}/swapfile"
+          fi
+          if [ ! -f "${SWAP_FILE}" ]; then
+            sudo fallocate -l 16G "${SWAP_FILE}" || sudo dd if=/dev/zero of="${SWAP_FILE}" bs=1M count=16384 status=none
+            sudo chmod 600 "${SWAP_FILE}"
+            sudo mkswap "${SWAP_FILE}"
+            sudo swapon "${SWAP_FILE}"
+          fi
+          sudo sysctl -w vm.swappiness=20 || true
+
+          echo "build_dir=${BUILD_BASE}/src" >> "${GITHUB_OUTPUT}"
+          echo "out_dir=${BUILD_BASE}/out" >> "${GITHUB_OUTPUT}"
+          echo "tmp_dir=${BUILD_BASE}/tmp" >> "${GITHUB_OUTPUT}"
+          echo "=== Disk usage and memory after setup ==="
+          df -h
+          free -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            aria2 \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            curl \
+            flex \
+            g++-multilib \
+            gcc-multilib \
+            git \
+            git-lfs \
+            gnupg \
+            gperf \
+            jq \
+            lib32ncurses5-dev \
+            lib32z1-dev \
+            libc6-dev-i386 \
+            libelf-dev \
+            libgl1-mesa-dev \
+            liblz4-tool \
+            libncurses5 \
+            libssl-dev \
+            libx11-dev \
+            libxml2 \
+            libxml2-utils \
+            lz4 \
+            lzop \
+            ninja-build \
+            pngcrush \
+            python3 \
+            python-is-python3 \
+            rsync \
+            squashfs-tools \
+            unzip \
+            xsltproc \
+            zip \
+            zlib1g-dev \
+            zstd
+
+          sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod 755 /usr/local/bin/repo
+
+          git config --global user.name "OrangeFox CI"
+          git config --global user.email "ci@localhost"
+          git config --global color.ui false
+
+      - name: Checkout marble OrangeFox device tree
+        uses: actions/checkout@v4
+        with:
+          path: device_tree
+          fetch-depth: 1
+
+      - name: Record device tree metadata
+        id: meta
+        env:
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+          INPUT_VARIANT: ${{ inputs.variant }}
+          INPUT_PATCH_VERSION: ${{ inputs.patch_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMMIT_SHA=$(git -C device_tree rev-parse --short=7 HEAD)
+          COMMIT_TITLE=$(git -C device_tree log -1 --pretty=%s)
+          BUILD_DATE=$(date -u +"%Y%m%d-%H%M")
+          START_TIME_WIB=$(TZ="Asia/Jakarta" date +"%Y-%m-%d %H:%M:%S WIB")
+          SAFE_BRANCH="${MANIFEST_BRANCH//\//-}"
+          ARTIFACT_NAME="OrangeFox-marble-${SAFE_BRANCH}-${COMMIT_SHA}-${BUILD_DATE}"
+
+          FOX_REL=$(curl -fsSL --max-time 10 "https://gitlab.com/OrangeFox/vendor/recovery/-/raw/main/OrangeFox_vendor.sh" 2>/dev/null \
+            | grep -m1 '^export FOX_INTERNAL_RELEASE=' | cut -d= -f2 | tr -d "\"'\r " || true)
+          if [ -z "${FOX_REL}" ]; then
+            FOX_REL="R12.0"
+          fi
+          OFOX_VERSION="${FOX_REL}"
+          if [ -n "${INPUT_PATCH_VERSION}" ]; then
+            OFOX_VERSION="${OFOX_VERSION}_${INPUT_PATCH_VERSION}"
+          fi
+          if [ -n "${INPUT_VARIANT}" ]; then
+            OFOX_VERSION="${OFOX_VERSION}_${INPUT_VARIANT}"
+          fi
+          OFOX_VERSION="${OFOX_VERSION}-${INPUT_BUILD_TYPE}"
+
+          echo "commit_sha=${COMMIT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "commit_title=${COMMIT_TITLE}" >> "${GITHUB_OUTPUT}"
+          echo "build_date=${BUILD_DATE}" >> "${GITHUB_OUTPUT}"
+          echo "start_time_wib=${START_TIME_WIB}" >> "${GITHUB_OUTPUT}"
+          echo "safe_branch=${SAFE_BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "ofox_version=${OFOX_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Notify Telegram build started
+        if: inputs.send_to_telegram
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+          START_TIME_WIB: ${{ steps.meta.outputs.start_time_wib }}
+          OFOX_VERSION: ${{ steps.meta.outputs.ofox_version }}
+          COMMIT_SHA: ${{ steps.meta.outputs.commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TG_TOKEN}" ] || [ -z "${TG_CHAT_ID}" ]; then
+            echo "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret is not set; skipping start notification."
+            exit 0
+          fi
+
+          THREAD_ARGS=()
+          if [ -n "${TG_TOPIC_ID}" ]; then
+            THREAD_ARGS=(-F "message_thread_id=${TG_TOPIC_ID}")
+          fi
+
+          START_MSG=$(printf "🔨 OrangeFox Recovery build started!\nTime: %s\nDevice: Redmi Note 12 Turbo (marble)\nVersion: %s\nCommit: %s\nRun: %s" \
+            "${START_TIME_WIB}" "${OFOX_VERSION}" "${COMMIT_SHA}" "${RUN_URL}")
+
+          curl -fsS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -F "chat_id=${TG_CHAT_ID}" \
+            "${THREAD_ARGS[@]+"${THREAD_ARGS[@]}"}" \
+            -F "text=${START_MSG}" \
+            -F "disable_web_page_preview=true" > /dev/null || \
+            echo "WARN: Telegram start notification failed; continuing build."
+
+      - name: Sync OrangeFox manifest
+        env:
+          BUILD_DIR: ${{ steps.workspace.outputs.build_dir }}
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "${MANIFEST_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "ERROR: Invalid manifest_branch '${MANIFEST_BRANCH}'" >&2
+            exit 1
+          fi
+          mkdir -p "${BUILD_DIR}"
+          cd "${BUILD_DIR}"
+
+          repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b "${MANIFEST_BRANCH}"
+          repo sync -c --no-clone-bundle --no-tags --force-sync -j"$(nproc)"
+          rm -rf "${BUILD_DIR}/.repo"
+          echo "=== Disk usage after repo sync cleanup ==="
+          df -h
+
+      - name: Stage device tree into device/xiaomi/marble
+        env:
+          BUILD_DIR: ${{ steps.workspace.outputs.build_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf \
+            "${BUILD_DIR}/device/xiaomi/marble" \
+            "${BUILD_DIR}/device/xiaomi/mondrian" \
+            "${BUILD_DIR}/device/xiaomi/sm84xx-common"
+          mkdir -p "${BUILD_DIR}/device/xiaomi"
+          cp -a "${GITHUB_WORKSPACE}/device_tree" "${BUILD_DIR}/device/xiaomi/marble"
+
+          python3 "${BUILD_DIR}/device/xiaomi/marble/patches/apply-ci-patches.py" "${BUILD_DIR}"
+
+      - name: Build OrangeFox recovery image
+        id: compile
+        env:
+          BUILD_DIR: ${{ steps.workspace.outputs.build_dir }}
+          OUT_DIR: ${{ steps.workspace.outputs.out_dir }}
+          TMP_DIR: ${{ steps.workspace.outputs.tmp_dir }}
+          INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+          INPUT_VARIANT: ${{ inputs.variant }}
+          INPUT_PATCH_VERSION: ${{ inputs.patch_version }}
+          INPUT_ENABLE_WLAN: ${{ inputs.enable_wlan }}
+          SECRET_MAINTAINER: ${{ secrets.OF_MAINTAINER }}
+          VAR_MAINTAINER: ${{ vars.OF_MAINTAINER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+          cd "${BUILD_DIR}"
+
+          export LC_ALL="C.UTF-8"
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export FOX_BUILD_DEVICE="marble"
+          export FOX_BUILD_TYPE="${INPUT_BUILD_TYPE}"
+          export OUT_DIR="${OUT_DIR}"
+          export TMPDIR="${TMP_DIR}"
+          export TEMP="${TMP_DIR}"
+          export TMP="${TMP_DIR}"
+          export _JAVA_OPTIONS="-Xmx4g"
+          export GOMEMLIMIT="11GiB"
+          export GOGC="50"
+          export GOMAXPROCS="2"
+
+          if [ -n "${SECRET_MAINTAINER}" ]; then
+            export OF_MAINTAINER="${SECRET_MAINTAINER}"
+          elif [ -n "${VAR_MAINTAINER}" ]; then
+            export OF_MAINTAINER="${VAR_MAINTAINER}"
+          else
+            export OF_MAINTAINER="${GITHUB_REPOSITORY_OWNER}"
+          fi
+
+          if [ -n "${INPUT_VARIANT}" ]; then
+            if ! [[ "${INPUT_VARIANT}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "ERROR: Invalid variant '${INPUT_VARIANT}'" >&2
+              exit 1
+            fi
+            export FOX_VARIANT="${INPUT_VARIANT}"
+          fi
+
+          if [ -n "${INPUT_PATCH_VERSION}" ]; then
+            if ! [[ "${INPUT_PATCH_VERSION}" =~ ^[0-9]+$ ]]; then
+              echo "ERROR: patch_version must be a whole number" >&2
+              exit 1
+            fi
+            export FOX_MAINTAINER_PATCH_VERSION="${INPUT_PATCH_VERSION}"
+          fi
+
+          if [ "${INPUT_ENABLE_WLAN}" = "true" ]; then
+            export OF_ENABLE_WLAN=1
+            export OF_WLAN_AP=1
+          else
+            export OF_ENABLE_WLAN=0
+            export OF_WLAN_AP=0
+          fi
+
+          # envsetup.sh relies on unset vars internally; temporarily relax nounset
+          set +u
+          source build/envsetup.sh
+          lunch twrp_marble-bp2a-eng || lunch twrp_marble-eng
+          set -u
+
+          NPROC=$(nproc)
+          if [ "${NPROC}" -le 4 ]; then
+            BUILD_JOBS=2
+          else
+            BUILD_JOBS=$((NPROC - 1))
+          fi
+          echo "Building with -j${BUILD_JOBS} (nproc=${NPROC}), TMPDIR=${TMPDIR}"
+
+          (
+            set +u
+            echo 500 > /proc/self/oom_score_adj 2>/dev/null || true
+            renice -n 10 "${BASHPID}" >/dev/null 2>&1 || true
+            mka -j"${BUILD_JOBS}" adbd recoveryimage
+          ) 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+      - name: Collect build artifacts and checksums
+        id: package
+        env:
+          OUT_DIR: ${{ steps.workspace.outputs.out_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ART_DIR="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "${ART_DIR}"
+
+          TARGET_OUT="${OUT_DIR}/target/product/marble"
+          if [ ! -d "${TARGET_OUT}" ]; then
+            echo "ERROR: Expected output directory ${TARGET_OUT} not found" >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          FOX_FILES=("${TARGET_OUT}"/OrangeFox-*.zip "${TARGET_OUT}"/OrangeFox-*.img "${TARGET_OUT}"/OrangeFox-*.md5)
+          if [ "${#FOX_FILES[@]}" -eq 0 ] && [ -f "${TARGET_OUT}/recovery.img" ]; then
+            cp -p "${TARGET_OUT}/recovery.img" "${ART_DIR}/OrangeFox-marble-recovery.img"
+          else
+            for f in "${FOX_FILES[@]}"; do
+              cp -p "${f}" "${ART_DIR}/"
+            done
+          fi
+
+          cd "${ART_DIR}"
+          if [ -z "$(ls -A "${ART_DIR}")" ]; then
+            echo "ERROR: No recovery image or zip artifacts were produced" >&2
+            exit 1
+          fi
+
+          md5sum OrangeFox-*.zip OrangeFox-*.img 2>/dev/null > MD5SUMS.txt || md5sum * > MD5SUMS.txt
+          sha256sum OrangeFox-*.zip OrangeFox-*.img 2>/dev/null > SHA256SUMS.txt || sha256sum * > SHA256SUMS.txt
+          ls -lh "${ART_DIR}"
+          cat MD5SUMS.txt
+          cat SHA256SUMS.txt
+
+          ZIP_NAME=$(ls -1 OrangeFox-*.zip 2>/dev/null | head -n1 || true)
+          IMG_NAME=$(ls -1 OrangeFox-*.img 2>/dev/null | head -n1 || true)
+          echo "art_dir=${ART_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "zip_name=${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "img_name=${IMG_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload GitHub Actions build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.art_dir }}/*
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: (failure() || cancelled()) && hashFiles('build.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-marble-${{ steps.meta.outputs.commit_sha || github.sha }}
+          path: build.log
+          retention-days: 7
+
+  release:
+    name: Publish Release and Notify Telegram
+    needs: build
+    if: always() && (inputs.create_release || inputs.send_to_telegram)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download build artifacts
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: artifacts
+
+      - name: Publish GitHub Release
+        id: release
+        if: needs.build.result == 'success' && inputs.create_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ART_DIR: ${{ github.workspace }}/artifacts
+          COMMIT_SHA: ${{ needs.build.outputs.commit_sha }}
+          COMMIT_TITLE: ${{ needs.build.outputs.commit_title }}
+          BUILD_DATE: ${{ needs.build.outputs.build_date }}
+          OFOX_VERSION: ${{ needs.build.outputs.ofox_version }}
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="fox16-${BUILD_DATE}-${COMMIT_SHA}"
+          RELEASE_DATE_WIB=$(TZ="Asia/Jakarta" date +"%Y-%m-%d")
+          NOTES=$(cat <<EOF
+          OrangeFox Recovery (${OFOX_VERSION}) for Redmi Note 12 Turbo (marble)
+
+          - Version: ${OFOX_VERSION}
+          - Manifest branch: ${MANIFEST_BRANCH}
+          - Build type: ${BUILD_TYPE}
+          - Kernel support: GKI 5.10 and GKI 6.6 ROMs
+          - Device tree commit: ${COMMIT_SHA} (${COMMIT_TITLE})
+
+          MD5 checksums:
+          \`\`\`
+          $(cat "${ART_DIR}/MD5SUMS.txt")
+          \`\`\`
+
+          SHA256 checksums:
+          \`\`\`
+          $(cat "${ART_DIR}/SHA256SUMS.txt")
+          \`\`\`
+          EOF
+          )
+          RELEASE_URL=$(gh release create "${TAG}" "${ART_DIR}"/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "OrangeFox Recovery (${RELEASE_DATE_WIB}) Build" \
+            --notes "${NOTES}" \
+            --latest)
+          echo "release_url=${RELEASE_URL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Send build artifacts to Telegram
+        if: always() && inputs.send_to_telegram
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          ART_DIR: ${{ github.workspace }}/artifacts
+          ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+          IMG_NAME: ${{ needs.build.outputs.img_name }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+          MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          OFOX_VERSION: ${{ needs.build.outputs.ofox_version }}
+          COMMIT_SHA: ${{ needs.build.outputs.commit_sha }}
+          COMMIT_TITLE: ${{ needs.build.outputs.commit_title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TG_TOKEN}" ] || [ -z "${TG_CHAT_ID}" ]; then
+            echo "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret is not set; skipping Telegram notification."
+            exit 0
+          fi
+
+          COMMIT_SHA="${COMMIT_SHA:-unknown}"
+          COMMIT_TITLE="${COMMIT_TITLE:-N/A}"
+          OFOX_VERSION="${OFOX_VERSION:-${MANIFEST_BRANCH}-${BUILD_TYPE}}"
+          END_TIME_WIB=$(TZ="Asia/Jakarta" date +"%Y-%m-%d %H:%M:%S WIB")
+          API_BASE="https://api.telegram.org/bot${TG_TOKEN}"
+          THREAD_ARGS=()
+          if [ -n "${TG_TOPIC_ID}" ]; then
+            THREAD_ARGS=(-F "message_thread_id=${TG_TOPIC_ID}")
+          fi
+
+          send_msg() {
+            local text="$1"
+            curl -fsS -X POST "${API_BASE}/sendMessage" \
+              -F "chat_id=${TG_CHAT_ID}" \
+              "${THREAD_ARGS[@]+"${THREAD_ARGS[@]}"}" \
+              -F "text=${text}" \
+              -F "disable_web_page_preview=true" > /dev/null
+          }
+
+          send_doc() {
+            local filepath="$1"
+            local caption="$2"
+            local size_bytes
+            size_bytes=$(stat -c%s "${filepath}")
+            # Standard Telegram Bot API sendDocument limit is 50 MiB (52428800 bytes)
+            if [ "${size_bytes}" -le 52428800 ]; then
+              curl -fsS -X POST "${API_BASE}/sendDocument" \
+                -F "chat_id=${TG_CHAT_ID}" \
+                "${THREAD_ARGS[@]+"${THREAD_ARGS[@]}"}" \
+                -F "document=@${filepath}" \
+                -F "caption=${caption}" > /dev/null
+              return 0
+            else
+              echo "Skipping direct Telegram upload for $(basename "${filepath}") (${size_bytes} bytes exceeds 50 MiB Bot API limit)."
+              return 1
+            fi
+          }
+
+          if [ "${BUILD_RESULT}" != "success" ]; then
+            MSG=$(printf "❌ OrangeFox Recovery build failed!\nTime: %s\nDevice: Redmi Note 12 Turbo (marble)\nVersion: %s\nCommit: %s - %s\nRun: %s" \
+              "${END_TIME_WIB}" "${OFOX_VERSION}" "${COMMIT_SHA}" "${COMMIT_TITLE}" "${RUN_URL}")
+            send_msg "${MSG}"
+            exit 0
+          fi
+
+          HASH_LINES=""
+          for fname in "${ZIP_NAME}" "${IMG_NAME}"; do
+            if [ -n "${fname}" ] && [ -f "${ART_DIR}/${fname}" ]; then
+              MD5=$(md5sum "${ART_DIR}/${fname}" | awk '{print $1}')
+              SIZE_HR=$(du -h "${ART_DIR}/${fname}" | awk '{print $1}')
+              SIZE_BYTES=$(stat -c%s "${ART_DIR}/${fname}")
+              if [ "${SIZE_BYTES}" -le 52428800 ]; then
+                LOC_TAG="sent to Telegram"
+              else
+                LOC_TAG=">50 MiB, uploaded to GitHub Release"
+              fi
+              LINE=$(printf "• %s (%s, %s)\n  MD5: %s" "${fname}" "${SIZE_HR}" "${LOC_TAG}" "${MD5}")
+              if [ -z "${HASH_LINES}" ]; then
+                HASH_LINES="${LINE}"
+              else
+                HASH_LINES=$(printf "%s\n%s" "${HASH_LINES}" "${LINE}")
+              fi
+            fi
+          done
+
+          SUMMARY=$(printf "✅ OrangeFox Recovery build completed!\nTime: %s\nDevice: Redmi Note 12 Turbo (marble)\nVersion: %s\nCommit: %s - %s" \
+            "${END_TIME_WIB}" "${OFOX_VERSION}" "${COMMIT_SHA}" "${COMMIT_TITLE}")
+          if [ -n "${RELEASE_URL}" ]; then
+            SUMMARY=$(printf "%s\nRelease: %s" "${SUMMARY}" "${RELEASE_URL}")
+          elif [ "${RELEASE_OUTCOME}" = "failure" ]; then
+            SUMMARY=$(printf "%s\nRelease: GitHub Release failed (artifacts remain in Workflow Artifacts)" "${SUMMARY}")
+          fi
+          SUMMARY=$(printf "%s\nRun: %s" "${SUMMARY}" "${RUN_URL}")
+          if [ -n "${HASH_LINES}" ]; then
+            SUMMARY=$(printf "%s\n\nMD5 Checksums:\n%s" "${SUMMARY}" "${HASH_LINES}")
+          fi
+          send_msg "${SUMMARY}"
+
+          for fname in "${ZIP_NAME}" "${IMG_NAME}"; do
+            if [ -n "${fname}" ] && [ -f "${ART_DIR}/${fname}" ]; then
+              MD5=$(md5sum "${ART_DIR}/${fname}" | awk '{print $1}')
+              SIZE_HR=$(du -h "${ART_DIR}/${fname}" | awk '{print $1}')
+              CAP=$(printf "✅ OrangeFox Recovery - Redmi Note 12 Turbo (marble)\nVersion: %s\nFile: %s (%s)\nMD5: %s" \
+                "${OFOX_VERSION}" "${fname}" "${SIZE_HR}" "${MD5}")
+              send_doc "${ART_DIR}/${fname}" "${CAP}" || true
+            fi
+          done

@@ -1,0 +1,2 @@
+# Battery / Power
+ro.charger.enable_suspend=1
